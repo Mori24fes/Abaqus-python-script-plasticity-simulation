@@ -1,0 +1,192 @@
+# -*- coding: mbcs -*-
+from abaqus import *
+from abaqusConstants import *
+import numpy as np
+import pandas as pd
+from odbAccess import openOdb
+import os
+import step
+from mesh import ElemType
+
+# Load input parameters from Excel
+input_file = r'C:\Users\MORTEZA\Desktop\input_parameters.xlsx'
+df = pd.read_excel(input_file)
+
+# Output Excel file setup
+output_file = r'C:\Users\MORTEZA\Desktop\simulation_results.xlsx'
+
+# Use ExcelWriter to write multiple sheets
+with pd.ExcelWriter(output_file) as writer:
+    sheets_written = 0
+
+    # Loop over each row in the input Excel file
+    for index, row in df.iterrows():
+        print(f"Processing run {index + 1}")
+
+        # Extract parameters
+        h = float(row['h'])
+        peak_friction = float(row['peak_friction'])
+        residual_friction = float(row['residual_friction'])
+        peak_dilation = float(row['peak_dilation'])
+        residual_dilation = float(row['residual_dilation'])
+        cohesion = float(row['cohesion'])
+        poisson = float(row['poisson'])
+        elastic_modulus = float(row['elastic_modulus'])
+        density = float(row['density'])
+        fault_angle = float(row['fault_angle'])  # in degrees
+
+        # Convert fault angle to radians for tangent calculation
+        fault_angle_rad = np.radians(fault_angle)
+        sin_fault_angle = np.sin(fault_angle_rad)
+        cos_fault_angle = np.cos(fault_angle_rad)
+
+        # Calculate displacements based on fault angle and soil thickness
+        d = 0.0175 * h
+        u1_bc = d * cos_fault_angle  # U1 for BC-5 and BC-6
+        u2_bc = d * sin_fault_angle  # U2 for BC-6
+
+        # Start building the model
+        model_name = 'Model-{}'.format(index + 1)
+        mdb.Model(name=model_name, modelType=STANDARD_EXPLICIT)
+        model = mdb.models[model_name]  # Correct reference
+
+        # Geometry (update height based on h)
+        s = model.ConstrainedSketch(name='__profile__', sheetSize=200.0)
+        s.rectangle(point1=(-50.0, 0.0), point2=(50.0, h))
+        p = model.Part(name='Part-1', dimensionality=TWO_D_PLANAR, type=DEFORMABLE_BODY)
+        p.BaseShell(sketch=s)
+        del model.sketches['__profile__']
+
+        # Material properties
+        mat = model.Material(name='Material-1')
+        mat.Density(table=((density,),))
+        mat.Elastic(table=((elastic_modulus, poisson),))
+        # mat.MohrCoulombPlasticity(table=((peak_friction, peak_dilation),))
+        mat.MohrCoulombPlasticity(dependencies=1, table=((peak_friction, peak_dilation, 0.0),
+                                                         ((peak_friction + residual_friction) / 2,
+                                                          (peak_dilation + residual_dilation) / 2, 0.05),
+                                                         (residual_friction, residual_dilation, 0.1),
+                                                         (residual_friction, residual_dilation, 0.2),
+                                                         (residual_friction, residual_dilation, 0.3)))
+        mat.mohrCoulombPlasticity.MohrCoulombHardening(table=((cohesion, 0.0),))
+        mat.Depvar(n=1)
+        mat.UserDefinedField()
+
+        # Section and assignment
+        model.HomogeneousSolidSection(name='Section-1', material='Material-1', thickness=None)
+        p.Set(faces=p.faces, name='Set-1')
+        p.SectionAssignment(region=p.sets['Set-1'], sectionName='Section-1', offset=0.0,
+                            offsetType=MIDDLE_SURFACE, thicknessAssignment=FROM_SECTION)
+
+        # Assembly
+        a = model.rootAssembly
+        a.DatumCsysByDefault(CARTESIAN)
+        inst = a.Instance(name='Part-1-1', part=p, dependent=ON)
+        a.makeIndependent(instances=(inst,))
+
+        # Steps
+        model.ImplicitDynamicsStep(name='Step-1', previous='Initial', initialInc=0.01, minInc=1E-05,maxNumInc=1000, nlgeom=ON)
+        model.ImplicitDynamicsStep(name='Step-2', previous='Step-1', initialInc=0.005, minInc=1E-06, maxNumInc=2000, nlgeom=ON)
+
+        # Field output requests
+        model.FieldOutputRequest(name='F-Output-Initial', createStepName='Step-1', variables=('COORD',))
+        model.FieldOutputRequest(name='F-Output-1', createStepName='Step-2',
+                                 variables=('S', 'PE', 'PEEQ', 'PEMAG', 'LE', 'U', 'V', 'A', 'RF', 'CSTRESS', 'CDISP', 'SDV', 'FV'))
+
+        # Load (Gravity)
+        model.Gravity(name='Load-1', createStepName='Step-2', comp2=-9.81, distributionType=UNIFORM)
+
+        # Mesh
+        a.seedPartInstance(regions=(inst,), size=0.5, deviationFactor=0.1, minSizeFactor=0.1)
+        a.setMeshControls(regions=inst.faces, elemShape=QUAD)
+        elemType = ElemType(elemCode=CPE4R, elemLibrary=STANDARD)
+        a.Set(name='MeshRegion', faces=inst.faces)
+        a.setElementType(regions=a.sets['MeshRegion'], elemTypes=(elemType,))
+        a.generateMesh(regions=(inst,))
+
+        # Sets
+        SURFACE_nodes = inst.nodes.getByBoundingBox(xMin=-50.0, xMax=+50.0, yMin=h, yMax=h)
+        a.Set(name='SURFACE', nodes=SURFACE_nodes)
+        left_nodes = inst.nodes.getByBoundingBox(xMin=-50.0, xMax=-50.0, yMin=0.0 + 1e-6, yMax=h)
+        a.Set(name='Left', nodes=left_nodes)
+        left_bottom_nodes = inst.nodes.getByBoundingBox(xMin=-50.0, xMax=0.0, yMin=0.0, yMax=0.0)
+        a.Set(name='LeftBottom', nodes=left_bottom_nodes)
+        Right_nodes = inst.nodes.getByBoundingBox(xMin=50.0, xMax=50.0, yMin=0.0 + 1e-6, yMax=h)
+        a.Set(name='Right', nodes=Right_nodes)
+        Right_bottom_nodes = inst.nodes.getByBoundingBox(xMin=0.0 + 1e-6, xMax=50.0 + 1e-6, yMin=0.0, yMax=0.0)
+        a.Set(name='RightBottom', nodes=Right_bottom_nodes)
+
+        # Boundary conditions
+        model.TabularAmplitude(name='Amp-1', timeSpan=STEP, data=((0.0, 0.0), (1.0, 1.0)))
+        model.DisplacementBC(name='BC-1', createStepName='Initial', region=a.sets['Left'], u1=SET, u2=UNSET, ur3=UNSET)
+        model.DisplacementBC(name='BC-2', createStepName='Initial', region=a.sets['LeftBottom'], u1=SET, u2=SET, ur3=UNSET)
+        model.DisplacementBC(name='BC-3', createStepName='Initial', region=a.sets['RightBottom'], u1=SET, u2=SET, ur3=UNSET)
+        model.DisplacementBC(name='BC-4', createStepName='Initial', region=a.sets['Right'], u1=SET, u2=UNSET, ur3=UNSET)
+        model.boundaryConditions['BC-1'].deactivate('Step-2')
+        model.boundaryConditions['BC-2'].deactivate('Step-2')
+        model.DisplacementBC(name='BC-5', createStepName='Step-2', region=a.sets['Left'], u1=u1_bc, u2=UNSET, ur3=UNSET, amplitude='Amp-1')
+        model.DisplacementBC(name='BC-6', createStepName='Step-2', region=a.sets['LeftBottom'], u1=u1_bc, u2=u2_bc,
+                             ur3=UNSET, amplitude='Amp-1')
+
+        # Job
+        job_name = 'Job-{}'.format(index + 1)
+        job = mdb.Job(name=job_name, model=model_name, type=ANALYSIS, numCpus=10, numDomains=10,
+                      userSubroutine='D:\\Payannameh Arshad\\verifications\\2009Dimitrious\\USDFLD02.for')
+        job.submit(consistencyChecking=OFF)
+        job.waitForCompletion()
+
+        # Extract results from ODB
+        odb_path = os.path.join(os.getcwd(), '{}.odb'.format(job_name))
+        odb = openOdb(odb_path)
+        ra = odb.rootAssembly
+        surface_set = ra.nodeSets['SURFACE']
+
+        # Initial coordinates (Step-1, first frame)
+        initial_frame = odb.steps['Step-1'].frames[0]
+        initial_coords = initial_frame.fieldOutputs['COORD'].getSubset(region=surface_set).values
+
+        # Deformed coordinates (Step-2, last frame)
+        run_output = []  # Collect results for this run only
+        if len(odb.steps['Step-2'].frames) > 0:
+            last_frame = odb.steps['Step-2'].frames[-1]
+            deformed_coords = last_frame.fieldOutputs['COORD'].getSubset(region=surface_set).values
+
+            # Save results for this run
+            for i, val in enumerate(initial_coords):
+                node_label = val.nodeLabel
+                init_x = val.data[0]
+                init_y = val.data[1]
+                disp_x = deformed_coords[i].data[0]
+                disp_y = deformed_coords[i].data[1]
+                run_output.append({
+                    'Node_Label': node_label,
+                    'Initial_X': init_x,
+                    'Initial_Y': init_y,
+                    'Displacement_X': disp_x,
+                    'Displacement_Y': disp_y
+                })
+                print(f"Node {node_label}: Initial X={init_x}, Y={init_y}, Disp X={disp_x}, Y={disp_y}")
+        else:
+            print(f"No frames found in 'Step-2' for run {index + 1}")
+            run_df = pd.DataFrame(run_output)
+            sheet_name = f'Run-{index + 1}'
+            if not run_df.empty:
+                run_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                sheets_written += 1
+            else:
+                print(f"No data to write for {sheet_name}")
+
+        odb.close()
+
+        # Create a DataFrame for this run's results
+        run_df = pd.DataFrame(run_output)
+        # if sheets_written == 0:
+        #     pd.DataFrame([{"Message": "No data available for any runs"}]).to_excel(writer, sheet_name='No Data',
+        #                                                                            index=False)
+        #     print("All runs failed to produce data; check simulation convergence.")
+        # # Write this run's results to a separate sheet
+        # sheet_name = f'Run-{index + 1}'
+        # run_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+# Print completion message
+print("Simulations completed and results saved to {}".format(output_file))
